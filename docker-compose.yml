@@ -1,0 +1,32 @@
+services:
+  waha:
+    image: devlikeapro/waha:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Point WAHA at the app's webhook so inbound messages are delivered.
+      - WHATSAPP_HOOK_URL=http://app:8000/webhook
+      - WHATSAPP_HOOK_EVENTS=message
+    volumes:
+      - waha_sessions:/app/.sessions
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Inside the compose network, reach WAHA by service name.
+      - WAHA_BASE_URL=http://waha:3000
+      - DB_PATH=/data/app.sqlite
+    ports:
+      - "8000:8000"
+    volumes:
+      - app_data:/data
+    depends_on:
+      - waha
+
+volumes:
+  waha_sessions:
+  app_data:
