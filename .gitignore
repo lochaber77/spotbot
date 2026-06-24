@@ -1,17 +1,20 @@
-# Secrets
+# Secrets — never commit
 .env
+*.json.key
+service-account*.json
+token*.json
 
-# Data / SQLite
-/data/
+# Data & sessions
 *.sqlite
-*.sqlite-journal
-*.sqlite-wal
-*.sqlite-shm
+*.sqlite3
+/data/
 
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
 .venv/
 venv/
-.pytest_cache/
-*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

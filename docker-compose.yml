@@ -1,32 +1,40 @@
 services:
+  # Unofficial WhatsApp HTTP API. Keeps the messy session handling in its own
+  # container and exposes a webhook (inbound) + REST (send). Multi-arch image,
+  # so it builds/pulls natively on the arm64 Mac mini.
   waha:
     image: devlikeapro/waha:latest
     restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
-      # Point WAHA at the app's webhook so inbound messages are delivered.
-      - WHATSAPP_HOOK_URL=http://app:8000/webhook
+      - WHATSAPP_HOOK_URL=${WEBHOOK_URL}
       - WHATSAPP_HOOK_EVENTS=message
+      - WAHA_API_KEY=${WAHA_API_KEY}
+      - TZ=${TZ}
     volumes:
-      - waha_sessions:/app/.sessions
+      - waha-sessions:/app/.sessions
 
+  # The "brain": FastAPI webhook receiver + Claude. SQLite lives on a volume so
+  # data survives restarts (and is a single file you can copy on cutover).
   app:
-    build: .
+    build: ./app
     restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      # Inside the compose network, reach WAHA by service name.
-      - WAHA_BASE_URL=http://waha:3000
-      - DB_PATH=/data/app.sqlite
-    ports:
-      - "8000:8000"
-    volumes:
-      - app_data:/data
     depends_on:
       - waha
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL}
+      - WAHA_URL=${WAHA_URL}
+      - WAHA_SESSION=${WAHA_SESSION}
+      - WAHA_API_KEY=${WAHA_API_KEY}
+      - ALLOWED_NUMBERS=${ALLOWED_NUMBERS}
+      - TZ=${TZ}
+    volumes:
+      - app-data:/data
 
 volumes:
-  waha_sessions:
-  app_data:
+  waha-sessions:
+  app-data:

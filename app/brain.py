@@ -1,16 +1,15 @@
-"""The 'brain': a Claude tool-use loop that drives the reminder tools.
+"""The Claude 'brain'.
 
-Flow: call Claude with the tool definitions; while it returns tool_use blocks,
-execute each (writing to the DB and scheduling jobs), feed back tool_result
-blocks, and call again; finally return Claude's text reply.
+Milestone 1 was a single-turn reply. Milestone 3 plugs in a tool-use loop for
+reminders: Claude can set, list, and cancel reminders, which write to the
+datastore and (de)register scheduler jobs. Calendar and email drafts are still
+later milestones.
 
-Time handling: we tell Claude the member's IANA timezone and the current local
-time, and ask it to return an absolute local wall-clock time as ISO 8601
-(no offset). We then localise that to the member's timezone and convert to UTC
-before storing. Storing UTC, displaying local — done in one place.
+Time handling: we tell Claude the member's timezone and current local time, and
+ask it to return an absolute local wall-clock time as ISO 8601 (no offset). We
+localise that to the member's timezone and convert to UTC before storing. Store
+UTC, display local — both conversions live here.
 """
-from __future__ import annotations
-
 import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -18,22 +17,36 @@ from zoneinfo import ZoneInfo
 from anthropic import AsyncAnthropic
 from sqlalchemy import select
 
-from . import db, scheduler
-from .config import settings
-from .db import FamilyMember, Reminder
+import config
+import db
+import scheduler
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("app.brain")
 
-client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+
+SYSTEM_PROMPT = (
+    "You are a helpful WhatsApp assistant for a family. You help organize and "
+    "plan, answer questions, and keep things light and friendly. Replies are "
+    "concise and suited to a chat app.\n\n"
+    "You can set, list, and cancel personal reminders using the provided tools. "
+    "Reminders are low-stakes and personal, so just do what's asked — no need to "
+    "confirm first. When setting a reminder, resolve relative times like "
+    "'tomorrow at 7am' or 'in 30 minutes' into an absolute local wall-clock time "
+    "using the member's timezone and current time given below, and pass it as "
+    "fire_at_iso. After using a tool, reply briefly and naturally, echoing the "
+    "absolute time you scheduled so they can sanity-check it.\n\n"
+    "You cannot yet create calendar events or draft emails — those capabilities "
+    "are coming. If asked, say they're not wired up yet rather than pretending."
+)
 
 TOOLS = [
     {
         "name": "set_reminder",
         "description": (
-            "Create a reminder for the family member. Resolve any relative time "
-            "(e.g. 'tomorrow at 7am', 'in 2 hours') into an absolute local "
-            "wall-clock time using the member's current time and timezone given "
-            "in the system prompt."
+            "Create a reminder for the member. Resolve any relative time into an "
+            "absolute local wall-clock time using the member's timezone and "
+            "current time from the system prompt."
         ),
         "input_schema": {
             "type": "object",
@@ -46,7 +59,7 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "Absolute local wall-clock time in ISO 8601 with no "
-                        "timezone offset, e.g. '2026-06-20T07:00:00'. Interpreted "
+                        "timezone offset, e.g. '2026-06-25T07:00:00'. Interpreted "
                         "in the member's timezone."
                     ),
                 },
@@ -82,10 +95,9 @@ TOOLS = [
 
 def _local_iso_to_utc(fire_at_iso: str, tz_name: str) -> datetime:
     """Convert a local wall-clock ISO string to a naive UTC datetime."""
-    tz = ZoneInfo(tz_name)
     dt = datetime.fromisoformat(fire_at_iso)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz)  # trust the member's timezone
+        dt = dt.replace(tzinfo=ZoneInfo(tz_name))  # trust the member's timezone
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
@@ -96,9 +108,9 @@ def _utc_to_local_str(dt_utc: datetime, tz_name: str) -> str:
     return local.strftime("%a %d %b %Y, %-I:%M %p %Z")
 
 
-# --- Tool implementations ---------------------------------------------------
+# --- Tool implementations (member is a detached FamilyMember snapshot) -------
 
-def _tool_set_reminder(member: FamilyMember, args: dict) -> str:
+def _tool_set_reminder(member, args: dict) -> str:
     text = args["text"]
     recurrence = args.get("recurrence")
     try:
@@ -107,7 +119,7 @@ def _tool_set_reminder(member: FamilyMember, args: dict) -> str:
         return f"ERROR: could not parse fire_at_iso ({exc})."
 
     with db.session_scope() as session:
-        reminder = Reminder(
+        reminder = db.Reminder(
             member_id=member.id,
             text=text,
             fire_at_utc=fire_at_utc,
@@ -127,12 +139,12 @@ def _tool_set_reminder(member: FamilyMember, args: dict) -> str:
     )
 
 
-def _tool_list_reminders(member: FamilyMember, args: dict) -> str:
+def _tool_list_reminders(member, args: dict) -> str:
     with db.session_scope() as session:
         rows = session.scalars(
-            select(Reminder)
-            .where(Reminder.member_id == member.id, Reminder.status == db.STATUS_SCHEDULED)
-            .order_by(Reminder.fire_at_utc)
+            select(db.Reminder)
+            .where(db.Reminder.member_id == member.id, db.Reminder.status == db.STATUS_SCHEDULED)
+            .order_by(db.Reminder.fire_at_utc)
         ).all()
         if not rows:
             return "No upcoming reminders."
@@ -144,10 +156,10 @@ def _tool_list_reminders(member: FamilyMember, args: dict) -> str:
         return "\n".join(lines)
 
 
-def _tool_cancel_reminder(member: FamilyMember, args: dict) -> str:
+def _tool_cancel_reminder(member, args: dict) -> str:
     reminder_id = args["reminder_id"]
     with db.session_scope() as session:
-        reminder = session.get(Reminder, reminder_id)
+        reminder = session.get(db.Reminder, reminder_id)
         if reminder is None or reminder.member_id != member.id:
             return f"ERROR: no reminder #{reminder_id} found for you."
         if reminder.status == db.STATUS_CANCELLED:
@@ -166,52 +178,59 @@ _DISPATCH = {
 }
 
 
-def _execute_tool(member: FamilyMember, name: str, args: dict) -> str:
+def _execute_tool(member, name: str, args: dict) -> str:
     handler = _DISPATCH.get(name)
     if handler is None:
         return f"ERROR: unknown tool {name!r}."
     try:
         return handler(member, args)
-    except Exception:  # noqa: BLE001 - surface failure to Claude, don't crash the loop
+    except Exception:  # surface failure to Claude, don't crash the loop
         log.exception("Tool %s failed", name)
         return f"ERROR: tool {name} failed unexpectedly."
 
 
-def _system_prompt(member: FamilyMember) -> str:
-    tz = ZoneInfo(member.timezone)
-    now_local = datetime.now(tz)
+def _system_prompt(member) -> str:
+    now_local = datetime.now(ZoneInfo(member.timezone))
     return (
-        "You are a helpful family WhatsApp assistant. You help family members "
-        "manage personal reminders via the provided tools.\n\n"
-        f"You are talking to: {member.name}.\n"
-        f"Their timezone: {member.timezone}.\n"
-        f"Current local time: {now_local.strftime('%A %Y-%m-%d %H:%M %Z')}.\n\n"
-        "When the member asks to set a reminder, resolve relative phrases like "
-        "'tomorrow at 7am' or 'in 30 minutes' into an absolute local wall-clock "
-        "time and pass it as fire_at_iso (ISO 8601, no offset). Reminders are "
-        "low-stakes and personal — just do what's asked, no need to confirm "
-        "before acting. After using a tool, reply briefly and naturally, "
-        "echoing the absolute time you scheduled so they can double-check it. "
-        "Keep replies concise and friendly for a chat app."
+        SYSTEM_PROMPT
+        + f"\n\nMember timezone: {member.timezone}."
+        + f"\nCurrent local time: {now_local.strftime('%A %Y-%m-%d %H:%M %Z')}."
     )
 
 
-async def handle_message(member: FamilyMember, text: str) -> str:
-    """Run the tool-use loop for one inbound message; return the text reply."""
+async def generate_reply(message_text: str, sender_number: str) -> str:
+    """Run the tool-use loop for one inbound message; return the text reply.
+
+    Resolves (or creates) the family member for `sender_number`. The caller has
+    already enforced the allow-list.
+    """
+    # Resolve the member and take a detached snapshot the tools can use without
+    # holding a session open across Claude calls.
+    with db.session_scope() as session:
+        m = db.get_or_create_member(session, sender_number)
+        session.add(db.Message(member_id=m.id, direction="in", text=message_text))
+        member = db.FamilyMember(
+            id=m.id,
+            name=m.name,
+            whatsapp_number=m.whatsapp_number,
+            timezone=m.timezone,
+            active=m.active,
+        )
+
     system = _system_prompt(member)
-    messages: list[dict] = [{"role": "user", "content": text}]
+    messages = [{"role": "user", "content": message_text}]
 
     for _ in range(8):  # safety bound on tool round-trips
         resp = await client.messages.create(
-            model=settings.claude_model,
-            max_tokens=settings.claude_max_tokens,
+            model=config.ANTHROPIC_MODEL,
+            max_tokens=1024,
             system=system,
             tools=TOOLS,
             messages=messages,
         )
 
         if resp.stop_reason != "tool_use":
-            return "".join(b.text for b in resp.content if b.type == "text").strip()
+            return "\n".join(b.text for b in resp.content if b.type == "text").strip() or "..."
 
         messages.append({"role": "assistant", "content": resp.content})
         tool_results = []

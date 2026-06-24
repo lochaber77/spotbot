@@ -1,7 +1,11 @@
-fastapi>=0.110
-uvicorn[standard]>=0.29
-httpx>=0.27
-python-dotenv>=1.0
-anthropic>=0.39
-sqlalchemy>=2.0
-apscheduler>=3.10,<4.0
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+httpx==0.27.*
+anthropic==0.40.*
+python-dotenv==1.0.*
+apscheduler==3.10.*            # M3 reminders (scheduler + persistent jobstore)
+sqlalchemy==2.0.*             # M3 datastore
+
+# Added in later milestones:
+# google-api-python-client==2.*  # M3 calendar
+# google-auth==2.*               # M3 calendar (service account)

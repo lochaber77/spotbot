@@ -1,48 +1,83 @@
-# CLAUDE.md — working notes for this repo
+# CLAUDE.md — context for Claude Code
 
-Family WhatsApp Assistant. WAHA delivers WhatsApp messages to a FastAPI app that
-gates on an allow-list and replies via Claude. Claude has reminder tools; the
-app schedules and proactively sends reminders.
+## What this is
+A self-hosted WhatsApp assistant for a family. It organizes/plans, sends
+reminders, drafts email replies (draft-only, never auto-send), and runs a small
+allow-list of pre-agreed automations with confirm-first defaults. Practical
+household tool, not production-grade. Full spec: `family-whatsapp-assistant-spec.md`.
 
-## Conventions (honor these)
+## Current state
+**M1 plumbing + first vertical slice: reminders.** WAHA + a FastAPI app that
+receives inbound messages, enforces a sender allow-list, and replies via Claude.
+The brain is now a **tool-use loop** (M2 brought forward) and reminders are wired
+end to end (the scheduler half of M3 was pulled forward, since reminders are the
+core feature and exercise the whole stack): a member can set/list/cancel
+reminders in natural language, and the app proactively sends each one when due
+and survives a restart. No calendar, email, or automations yet.
 
-- **Secrets** live in `.env` only (gitignored). Never commit them.
-- **Data** lives under `/data` (SQLite at `/data/app.sqlite`). The path is
-  configurable via `DB_PATH`.
-- **Timezones:** store `fire_at_utc` in UTC (naive datetimes that are always
-  UTC); display in the member's local timezone. Conversions live in
-  `app/brain.py` (`_local_iso_to_utc`, `_utc_to_local_str`).
-- **Keep changes scoped.** Current slice is reminders only — no calendar, email,
-  or automation framework yet.
-
-## Layout
-
-- `app/config.py` — settings + allow-list.
-- `app/whatsapp.py` — WAHA client + webhook parsing.
-- `app/db.py` — SQLAlchemy models (`FamilyMember`, `Reminder`, `MessageLog`),
+### Code layout (flat modules in `app/`, built via `docker compose build ./app`)
+- `app/config.py` — env settings + allow-list; `DATA_DIR`/`DB_PATH`/`DB_URL`.
+- `app/whatsapp.py` — WAHA client (`send_text(number, text)`).
+- `app/main.py` — FastAPI `/webhook` + `/health`; lifespan inits DB + scheduler.
+- `app/brain.py` — Claude tool-use loop; reminder tools + UTC↔local helpers
+  (`_local_iso_to_utc`, `_utc_to_local_str`).
+- `app/db.py` — SQLAlchemy models (`FamilyMember`, `Reminder`, `Message`),
   sessions, `get_or_create_member`.
 - `app/scheduler.py` — APScheduler `AsyncIOScheduler` + persistent SQLAlchemy
   jobstore; `schedule_reminder`, `cancel_reminder_job`, `fire_reminder`.
-- `app/brain.py` — Claude tool-use loop + tool implementations.
-- `app/main.py` — FastAPI app, startup wiring, `/webhook`, `/health`.
+
+## Stack
+- WhatsApp: **WAHA** (Docker) — unofficial library wrapper. (Alternative: Baileys-direct.)
+- App: **Python 3.12 + FastAPI**, Anthropic SDK (Claude tool-use planned in M2).
+- Datastore: **SQLite** to start (file-copy migration); Postgres is the upgrade path.
+- Scheduler (M3): APScheduler with a **persistent jobstore** — reminders must survive restarts.
+- Calendar (M3): one **shared Google Calendar** via a **service account** (no per-person OAuth).
+- Email (M4): Gmail **drafts** endpoint, **per-user OAuth**, opt-in. Never sends.
+- Packaging: Docker + docker-compose; **build from source on the Mac** (arm64).
+
+## Milestones
+1. Plumbing — echo + allow-list (DONE).
+2. Brain — Claude tool-use loop turning messages into structured intents (DONE).
+3. Calendar + reminders — **reminders DONE** (fire + survive restart);
+   shared-calendar writes still TODO.
+4. Email drafts — per-user Gmail OAuth, draft-on-request.
+5. Automations — allow-list + confirm-first + consent recording.
+6. Cutover — move to the Mac mini.
 
 ## Scheduler invariants (do not break)
-
-- Job id **is** the reminder id (str). Re-scheduling uses
-  `replace_existing=True` → idempotent.
+- Job id **is** the reminder id (str). Re-scheduling uses `replace_existing=True`
+  → idempotent.
 - `coalesce=True` + `misfire_grace_time=3600` → a reminder due during downtime
   fires **once** on restart, never multiple times, never silently dropped.
 - The jobstore shares the app's SQLite DB so jobs persist and rehydrate on boot.
-- `fire_reminder` runs **outside** the request: it opens its own DB session and
-  makes its own WAHA call. Don't pass request-scoped state into it.
+- `fire_reminder` runs **outside** the request: its own DB session, its own WAHA
+  call. Don't pass request-scoped state into it.
 
 ## Adding a Claude tool
-
 1. Add the JSON schema to `TOOLS` in `app/brain.py`.
 2. Implement `_tool_<name>(member, args) -> str` and register it in `_DISPATCH`.
 3. Tools return a short string that goes back to Claude as a `tool_result`.
 
-## Running / testing
+## Conventions / guardrails
+- Secrets in `.env` (gitignored). Service-account JSON and OAuth tokens live
+  outside the repo, mounted read-only. Never commit secrets.
+- Dedicated WhatsApp number on a separate SIM — never a personal number.
+- Re-pair WhatsApp with a fresh QR on each host; never run two hosts against the
+  number at once.
+- Email is **draft-only**. No send capability should exist in code.
+- Consequential actions (shared events, emails) go through confirm-first.
+  Personal reminders are low-stakes and execute directly (no confirm).
+- **Timezones:** store `fire_at_utc` in UTC (naive datetimes that are always
+  UTC); display in the member's local timezone. Conversions live in `app/brain.py`.
 
-See `README.md` ("Running" and "Acceptance tests"). Quick checks:
-`curl localhost:8000/health` and `sqlite3 $DB_PATH "SELECT * FROM reminders;"`.
+## Run
+See `README.md`. Inbound webhook is `POST /webhook`; health is `GET /health`.
+
+## Open decisions (pick as you go)
+- WAHA+Python (current) vs Baileys-direct.
+- SQLite (current) vs Postgres.
+- Which Google account owns the shared calendar.
+- Single family timezone vs per-member overrides. (Currently: members carry a
+  `timezone` column defaulting to the family `TZ` — single-tz today, per-member
+  later without a migration.)
+- Confirmation-expiry window length.

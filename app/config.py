@@ -1,60 +1,30 @@
-"""Application configuration, loaded from environment / .env.
-
-Secrets live in .env (never committed). Persistent data lives under /data.
-"""
-from __future__ import annotations
-
+"""Configuration loaded from environment variables."""
 import os
-from functools import lru_cache
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-def _clean_number(raw: str) -> str:
-    """Normalise a phone number to digits only (strip +, spaces, @c.us, etc.)."""
-    raw = raw.split("@", 1)[0]
-    return "".join(ch for ch in raw if ch.isdigit())
+WAHA_URL = os.getenv("WAHA_URL", "http://waha:3000")
+WAHA_SESSION = os.getenv("WAHA_SESSION", "default")
+WAHA_API_KEY = os.getenv("WAHA_API_KEY", "")
 
+# Comma-separated WhatsApp numbers (international format, no '+') allowed to use
+# the bot. Everyone else is ignored. This is the privacy + anti-abuse gate.
+ALLOWED_NUMBERS = {
+    n.strip() for n in os.getenv("ALLOWED_NUMBERS", "").split(",") if n.strip()
+}
 
-class Settings:
-    def __init__(self) -> None:
-        # --- Claude ---
-        self.anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
-        self.claude_model: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-        self.claude_max_tokens: int = int(os.getenv("CLAUDE_MAX_TOKENS", "1024"))
+TZ = os.getenv("TZ", "Europe/London")
 
-        # --- WAHA (WhatsApp HTTP API) ---
-        self.waha_base_url: str = os.getenv("WAHA_BASE_URL", "http://localhost:3000").rstrip("/")
-        self.waha_session: str = os.getenv("WAHA_SESSION", "default")
-        self.waha_api_key: str = os.getenv("WAHA_API_KEY", "")
-
-        # --- Access control ---
-        # Comma-separated list of allowed WhatsApp numbers (any format; normalised to digits).
-        self.allowed_numbers: set[str] = {
-            _clean_number(n) for n in os.getenv("ALLOWED_NUMBERS", "").split(",") if n.strip()
-        }
-
-        # --- Data / persistence ---
-        self.db_path: str = os.getenv("DB_PATH", "/data/app.sqlite")
-
-        # --- Defaults ---
-        self.default_timezone: str = os.getenv("DEFAULT_TIMEZONE", "America/New_York")
-
-    @property
-    def db_url(self) -> str:
-        return f"sqlite:///{self.db_path}"
-
-    def is_allowed(self, number: str) -> bool:
-        return _clean_number(number) in self.allowed_numbers
-
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
-
-
-# Convenience module-level singleton.
-settings = get_settings()
-clean_number = _clean_number
+# --- Datastore / scheduler (M3) ---
+# Data lives on the mounted volume (see Dockerfile's DATA_DIR=/data and the
+# app-data volume in docker-compose). SQLite is a single file we can copy on
+# cutover; the APScheduler jobstore shares the same file so reminders survive
+# restarts.
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "app.sqlite"))
+DB_URL = f"sqlite:///{DB_PATH}"
