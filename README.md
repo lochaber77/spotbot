@@ -80,6 +80,32 @@ docker compose exec app python -c "import sqlite3;print(sqlite3.connect('/data/a
 curl localhost:8000/health    # {"ok": true, "jobs": N}
 ```
 
+## Shared calendar (optional)
+
+The bot can read the family's **shared Google Calendar** and create events on it.
+It authenticates as a **service account** (no per-person OAuth): create a calendar,
+share it with the service account's email granting "Make changes to events", and
+give the bot the calendar id + key file.
+
+Enable it in `.env`:
+
+```
+GOOGLE_CALENDAR_ID=abc123@group.calendar.google.com
+GOOGLE_SERVICE_ACCOUNT_HOST_PATH=./secrets/service-account.json   # host path to the key
+```
+
+then uncomment the read-only `/secrets/service-account.json` mount in
+`docker-compose.yml`. Until both the id and a readable key are present, calendar
+features stay off and the bot says so if asked.
+
+Usage (natural language):
+- "what's on this week?" → lists shared-calendar events in local time.
+- "add football Saturday 10–11am" → the bot **proposes** it and asks you to
+  confirm; it's created **only after you reply "yes"** (calendar events affect the
+  whole family, so writes are confirm-first, with a `CONFIRMATION_TTL_MINUTES`
+  expiry). Reminders remain low-stakes and execute directly.
+
 ## Safety notes
 - Keep `ALLOWED_NUMBERS` tight; the bot ignores everyone else and all group chats.
-- Never commit `.env` or any credentials.
+- Never commit `.env` or any credentials. The service-account JSON lives outside
+  the repo and is mounted read-only.

@@ -39,6 +39,11 @@ STATUS_SCHEDULED = "scheduled"
 STATUS_SENT = "sent"
 STATUS_CANCELLED = "cancelled"
 
+# Pending-confirmation status values (confirm-first flow).
+PC_PENDING = "pending"
+PC_DECLINED = "declined"
+PC_EXECUTED = "executed"
+
 
 class Base(DeclarativeBase):
     pass
@@ -81,6 +86,43 @@ class Message(Base):
     direction: Mapped[str] = mapped_column(String, nullable=False)  # "in" | "out"
     text: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+
+
+class CalendarEvent(Base):
+    """Cache of shared-calendar events the bot created (M3).
+
+    Times are naive UTC, same convention as reminders.
+    """
+
+    __tablename__ = "calendar_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    google_event_id: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    start_utc: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    end_utc: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    attendees: Mapped[str | None] = mapped_column(String, nullable=True)  # comma-separated
+    created_by: Mapped[int] = mapped_column(ForeignKey("family_members.id"), nullable=False)
+    html_link: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+
+
+class PendingConfirmation(Base):
+    """A consequential action (e.g. a shared calendar write) awaiting a yes/no.
+
+    The brain injects the latest pending row for a member into the system prompt,
+    so confirm-first works across messages without conversation memory.
+    """
+
+    __tablename__ = "pending_confirmations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    member_id: Mapped[int] = mapped_column(ForeignKey("family_members.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)  # e.g. "calendar_event"
+    payload: Mapped[str] = mapped_column(String, nullable=False)  # JSON
+    status: Mapped[str] = mapped_column(String, default=PC_PENDING, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 # check_same_thread=False: APScheduler and the request loop touch the file from

@@ -32,8 +32,15 @@ services:
       - WAHA_API_KEY=${WAHA_API_KEY}
       - ALLOWED_NUMBERS=${ALLOWED_NUMBERS}
       - TZ=${TZ}
+      # Shared calendar (M3). Blank GOOGLE_CALENDAR_ID keeps it disabled.
+      - GOOGLE_CALENDAR_ID=${GOOGLE_CALENDAR_ID}
+      - GOOGLE_SERVICE_ACCOUNT_JSON=${GOOGLE_SERVICE_ACCOUNT_JSON:-/secrets/service-account.json}
+      - CONFIRMATION_TTL_MINUTES=${CONFIRMATION_TTL_MINUTES:-30}
     volumes:
       - app-data:/data
+      # To enable the shared calendar, drop the service-account JSON at
+      # GOOGLE_SERVICE_ACCOUNT_HOST_PATH and uncomment this read-only mount:
+      # - ${GOOGLE_SERVICE_ACCOUNT_HOST_PATH:-./secrets/service-account.json}:/secrets/service-account.json:ro
 
 volumes:
   waha-sessions:

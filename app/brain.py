@@ -10,8 +10,9 @@ ask it to return an absolute local wall-clock time as ISO 8601 (no offset). We
 localise that to the member's timezone and convert to UTC before storing. Store
 UTC, display local — both conversions live here.
 """
+import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from anthropic import AsyncAnthropic
@@ -19,6 +20,7 @@ from sqlalchemy import select
 
 import config
 import db
+import gcal
 import scheduler
 
 log = logging.getLogger("app.brain")
@@ -35,9 +37,7 @@ SYSTEM_PROMPT = (
     "'tomorrow at 7am' or 'in 30 minutes' into an absolute local wall-clock time "
     "using the member's timezone and current time given below, and pass it as "
     "fire_at_iso. After using a tool, reply briefly and naturally, echoing the "
-    "absolute time you scheduled so they can sanity-check it.\n\n"
-    "You cannot yet create calendar events or draft emails — those capabilities "
-    "are coming. If asked, say they're not wired up yet rather than pretending."
+    "absolute time you scheduled so they can sanity-check it."
 )
 
 TOOLS = [
@@ -86,6 +86,75 @@ TOOLS = [
                 "reminder_id": {"type": "integer", "description": "The reminder's id."},
             },
             "required": ["reminder_id"],
+        },
+    },
+]
+
+
+# Calendar tools are only offered when the shared calendar is configured.
+CALENDAR_TOOLS = [
+    {
+        "name": "create_calendar_event",
+        "description": (
+            "Propose a new event on the family's shared calendar. This affects the "
+            "whole family, so it is CONFIRM-FIRST: this records a proposal and does "
+            "NOT create the event. Tell the user what you're about to add and ask "
+            "them to confirm; the event is only created once they say yes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Event title."},
+                "start_iso": {
+                    "type": "string",
+                    "description": (
+                        "Start as absolute local wall-clock time, ISO 8601 with no "
+                        "offset, e.g. '2026-07-10T15:00:00'. Member's timezone."
+                    ),
+                },
+                "end_iso": {
+                    "type": "string",
+                    "description": "End time, same format as start_iso.",
+                },
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional attendee email addresses.",
+                },
+            },
+            "required": ["title", "start_iso", "end_iso"],
+        },
+    },
+    {
+        "name": "list_schedule",
+        "description": "Read upcoming events from the family's shared calendar.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_iso": {
+                    "type": "string",
+                    "description": "Optional window start (local ISO 8601). Defaults to now.",
+                },
+                "end_iso": {
+                    "type": "string",
+                    "description": "Optional window end (local ISO 8601). Defaults to 7 days out.",
+                },
+            },
+        },
+    },
+    {
+        "name": "resolve_confirmation",
+        "description": (
+            "Approve or decline a pending confirmation (its id is given in the "
+            "system prompt when one is awaiting the user's yes/no)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "confirmation_id": {"type": "integer", "description": "The pending confirmation id."},
+                "approve": {"type": "boolean", "description": "true to confirm, false to decline."},
+            },
+            "required": ["confirmation_id", "approve"],
         },
     },
 ]
@@ -171,11 +240,164 @@ def _tool_cancel_reminder(member, args: dict) -> str:
     return f"Cancelled reminder #{reminder_id}: '{text}'."
 
 
+# --- Calendar tools (confirm-first for writes) ------------------------------
+
+def _tool_create_calendar_event(member, args: dict) -> str:
+    if not config.CALENDAR_ENABLED:
+        return "ERROR: the shared calendar isn't configured yet."
+    title = args["title"]
+    try:
+        start_utc = _local_iso_to_utc(args["start_iso"], member.timezone)
+        end_utc = _local_iso_to_utc(args["end_iso"], member.timezone)
+    except ValueError as exc:
+        return f"ERROR: could not parse start/end ({exc})."
+
+    payload = {
+        "title": title,
+        "start_utc": start_utc.isoformat(),
+        "end_utc": end_utc.isoformat(),
+        "attendees": args.get("attendees") or [],
+    }
+    with db.session_scope() as session:
+        pending = db.PendingConfirmation(
+            member_id=member.id,
+            kind="calendar_event",
+            payload=json.dumps(payload),
+            status=db.PC_PENDING,
+            expires_at=db.utcnow() + timedelta(minutes=config.CONFIRMATION_TTL_MINUTES),
+        )
+        session.add(pending)
+        session.flush()
+        cid = pending.id
+
+    when = _utc_to_local_str(start_utc, member.timezone)
+    return (
+        f"PROPOSED (confirmation_id={cid}): shared calendar event '{title}' on {when}. "
+        "This affects the whole family — ask the user to confirm before it is created; "
+        "do not create it yet."
+    )
+
+
+def _tool_list_schedule(member, args: dict) -> str:
+    if not config.CALENDAR_ENABLED:
+        return "ERROR: the shared calendar isn't configured yet."
+    try:
+        start_utc = (
+            _local_iso_to_utc(args["start_iso"], member.timezone)
+            if args.get("start_iso")
+            else db.utcnow()
+        )
+        end_utc = (
+            _local_iso_to_utc(args["end_iso"], member.timezone)
+            if args.get("end_iso")
+            else start_utc + timedelta(days=7)
+        )
+    except ValueError as exc:
+        return f"ERROR: could not parse date range ({exc})."
+
+    try:
+        events = gcal.list_events(start_utc, end_utc)
+    except Exception:  # network / API error — tell Claude, don't crash the loop
+        log.exception("calendar list failed")
+        return "ERROR: couldn't read the calendar (API error)."
+
+    if not events:
+        return "Nothing on the shared calendar in that window."
+    lines = []
+    for event in events:
+        raw = event["start"]
+        try:
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo(member.timezone))
+            when = dt.astimezone(ZoneInfo(member.timezone)).strftime("%a %d %b, %-I:%M %p")
+        except ValueError:
+            when = raw  # all-day date (YYYY-MM-DD)
+        lines.append(f"• {event['summary']} — {when}")
+    return "\n".join(lines)
+
+
+def _tool_resolve_confirmation(member, args: dict) -> str:
+    cid = args["confirmation_id"]
+    approve = bool(args.get("approve", False))
+
+    # Load + validate + record the decision; keep the DB session closed during
+    # the outbound calendar call.
+    with db.session_scope() as session:
+        pending = session.get(db.PendingConfirmation, cid)
+        if pending is None or pending.member_id != member.id:
+            return f"ERROR: no pending confirmation #{cid} for you."
+        if pending.status != db.PC_PENDING:
+            return f"Confirmation #{cid} was already {pending.status}."
+        expired = pending.expires_at <= db.utcnow()
+        kind = pending.kind
+        payload = json.loads(pending.payload)
+        if expired or not approve:
+            pending.status = db.PC_DECLINED
+
+    if expired:
+        return f"That request (#{cid}) expired — please ask again."
+    if not approve:
+        return "Okay, cancelled — nothing was added."
+
+    if kind != "calendar_event":
+        return f"ERROR: unknown confirmation kind {kind!r}."
+
+    start_utc = datetime.fromisoformat(payload["start_utc"])
+    end_utc = datetime.fromisoformat(payload["end_utc"])
+    try:
+        event = gcal.create_event(
+            payload["title"], start_utc, end_utc, attendees=payload.get("attendees") or None
+        )
+    except Exception:
+        log.exception("calendar create failed")
+        return "ERROR: couldn't create the event (calendar API error)."
+
+    with db.session_scope() as session:
+        pending = session.get(db.PendingConfirmation, cid)
+        if pending is not None:
+            pending.status = db.PC_EXECUTED
+        session.add(
+            db.CalendarEvent(
+                google_event_id=event["id"],
+                title=payload["title"],
+                start_utc=start_utc,
+                end_utc=end_utc,
+                attendees=",".join(payload.get("attendees") or []) or None,
+                created_by=member.id,
+                html_link=event.get("htmlLink"),
+            )
+        )
+
+    when = _utc_to_local_str(start_utc, member.timezone)
+    return f"Added '{payload['title']}' to the family calendar for {when}."
+
+
 _DISPATCH = {
     "set_reminder": _tool_set_reminder,
     "list_reminders": _tool_list_reminders,
     "cancel_reminder": _tool_cancel_reminder,
+    "create_calendar_event": _tool_create_calendar_event,
+    "list_schedule": _tool_list_schedule,
+    "resolve_confirmation": _tool_resolve_confirmation,
 }
+
+
+def _pending_for(member_id: int):
+    """The member's latest un-expired pending confirmation, or None."""
+    with db.session_scope() as session:
+        pending = session.scalars(
+            select(db.PendingConfirmation)
+            .where(
+                db.PendingConfirmation.member_id == member_id,
+                db.PendingConfirmation.status == db.PC_PENDING,
+                db.PendingConfirmation.expires_at > db.utcnow(),
+            )
+            .order_by(db.PendingConfirmation.created_at.desc())
+        ).first()
+        if pending is None:
+            return None
+        return {"id": pending.id, "kind": pending.kind, "payload": json.loads(pending.payload)}
 
 
 def _execute_tool(member, name: str, args: dict) -> str:
@@ -189,13 +411,37 @@ def _execute_tool(member, name: str, args: dict) -> str:
         return f"ERROR: tool {name} failed unexpectedly."
 
 
-def _system_prompt(member) -> str:
+def _system_prompt(member, pending=None) -> str:
     now_local = datetime.now(ZoneInfo(member.timezone))
-    return (
-        SYSTEM_PROMPT
-        + f"\n\nMember timezone: {member.timezone}."
-        + f"\nCurrent local time: {now_local.strftime('%A %Y-%m-%d %H:%M %Z')}."
+    parts = [SYSTEM_PROMPT]
+
+    if config.CALENDAR_ENABLED:
+        parts.append(
+            "You can also read the family's shared calendar (list_schedule) and "
+            "propose new events (create_calendar_event). Calendar events affect "
+            "everyone, so they are CONFIRM-FIRST: after create_calendar_event, tell "
+            "the user exactly what you'll add and ask them to confirm. Only once "
+            "they say yes do you call resolve_confirmation to create it."
+        )
+    else:
+        parts.append("You cannot read or create calendar events yet — that isn't configured.")
+    parts.append("You cannot draft emails yet — that capability is coming.")
+
+    if pending:
+        p = pending["payload"]
+        parts.append(
+            f"There is a PENDING confirmation (confirmation_id={pending['id']}) "
+            f"awaiting the user's yes/no — {pending['kind']}: '{p.get('title', '')}' "
+            f"at {p.get('start_utc', '')} UTC. If the user approves in this message, "
+            f"call resolve_confirmation(confirmation_id={pending['id']}, approve=true); "
+            "if they decline, approve=false."
+        )
+
+    parts.append(
+        f"Member timezone: {member.timezone}."
+        f"\nCurrent local time: {now_local.strftime('%A %Y-%m-%d %H:%M %Z')}."
     )
+    return "\n\n".join(parts)
 
 
 async def generate_reply(message_text: str, sender_number: str) -> str:
@@ -217,7 +463,9 @@ async def generate_reply(message_text: str, sender_number: str) -> str:
             active=m.active,
         )
 
-    system = _system_prompt(member)
+    pending = _pending_for(member.id)
+    system = _system_prompt(member, pending)
+    tools = TOOLS + (CALENDAR_TOOLS if config.CALENDAR_ENABLED else [])
     messages = [{"role": "user", "content": message_text}]
 
     for _ in range(8):  # safety bound on tool round-trips
@@ -225,7 +473,7 @@ async def generate_reply(message_text: str, sender_number: str) -> str:
             model=config.ANTHROPIC_MODEL,
             max_tokens=1024,
             system=system,
-            tools=TOOLS,
+            tools=tools,
             messages=messages,
         )
 
