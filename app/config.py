@@ -44,3 +44,10 @@ CALENDAR_ENABLED = bool(
 
 # Confirm-first: how long a proposed action waits for the user's "yes".
 CONFIRMATION_TTL_MINUTES = int(os.getenv("CONFIRMATION_TTL_MINUTES", "30"))
+
+# --- Gmail drafts (M4, per-user OAuth, opt-in) ---
+# Consumer Gmail can't use a service account, so email is per-user OAuth and
+# opt-in: a member is email-enabled only if a token file exists for their number
+# under GMAIL_TOKENS_DIR (produced by scripts/gmail_authorize.py, mounted
+# read-only). The bot creates DRAFTS only and never sends (see spec §9/§10).
+GMAIL_TOKENS_DIR = os.getenv("GMAIL_TOKENS_DIR", "/secrets/gmail")

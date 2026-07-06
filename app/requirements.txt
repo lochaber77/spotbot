@@ -5,8 +5,6 @@ anthropic==0.40.*
 python-dotenv==1.0.*
 apscheduler==3.10.*            # M3 reminders (scheduler + persistent jobstore)
 sqlalchemy==2.0.*             # M3 datastore
-google-api-python-client==2.*  # M3 shared calendar
-google-auth==2.*               # M3 calendar (service account)
-
-# Added in later milestones:
-# (Gmail draft client reuses google-api-python-client + google-auth-oauthlib)
+google-api-python-client==2.*  # M3 shared calendar + M4 Gmail drafts
+google-auth==2.*               # M3 calendar (service account) + M4 token refresh
+google-auth-oauthlib==1.*      # M4: scripts/gmail_authorize.py (local consent flow)

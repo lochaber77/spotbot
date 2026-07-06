@@ -36,11 +36,16 @@ services:
       - GOOGLE_CALENDAR_ID=${GOOGLE_CALENDAR_ID}
       - GOOGLE_SERVICE_ACCOUNT_JSON=${GOOGLE_SERVICE_ACCOUNT_JSON:-/secrets/service-account.json}
       - CONFIRMATION_TTL_MINUTES=${CONFIRMATION_TTL_MINUTES:-30}
+      # Gmail drafts (M4). Enabled per-member when a token file exists here.
+      - GMAIL_TOKENS_DIR=${GMAIL_TOKENS_DIR:-/secrets/gmail}
     volumes:
       - app-data:/data
       # To enable the shared calendar, drop the service-account JSON at
       # GOOGLE_SERVICE_ACCOUNT_HOST_PATH and uncomment this read-only mount:
       # - ${GOOGLE_SERVICE_ACCOUNT_HOST_PATH:-./secrets/service-account.json}:/secrets/service-account.json:ro
+      # To enable Gmail drafts, put per-member tokens under GMAIL_TOKENS_HOST_PATH
+      # (see scripts/gmail_authorize.py) and uncomment this read-only mount:
+      # - ${GMAIL_TOKENS_HOST_PATH:-./secrets/gmail}:/secrets/gmail:ro
 
 volumes:
   waha-sessions:

@@ -105,7 +105,33 @@ Usage (natural language):
   whole family, so writes are confirm-first, with a `CONFIRMATION_TTL_MINUTES`
   expiry). Reminders remain low-stakes and execute directly.
 
+## Email drafts (optional, per-member, opt-in)
+
+The bot can draft email replies in a member's own Gmail — **drafts only, it never
+sends**. Consumer Gmail can't use a service account, so this is per-user OAuth and
+opt-in: only members who authorize get it.
+
+Enable it for one member (run on a machine **with a browser**, not the container):
+
+```
+pip install google-auth-oauthlib
+python scripts/gmail_authorize.py \
+    --number 447700900000 \
+    --client-secrets ~/client_secret.json \
+    --out ./secrets/gmail
+```
+
+Set `GMAIL_TOKENS_HOST_PATH=./secrets/gmail` in `.env` and uncomment the read-only
+`/secrets/gmail` mount in `docker-compose.yml`. A member is email-enabled only if a
+`<number>.json` token exists; otherwise the bot says email isn't set up for them.
+
+Usage (natural language): "reply to Nan saying we'll be there at 1" → the bot
+**proposes** the draft and asks you to confirm; on "yes" it creates the draft in
+your Gmail Drafts for you to review and send. Drafting reaches outside the system,
+so it's confirm-first; **the code has no send path at all** (spec §9/§10).
+
 ## Safety notes
 - Keep `ALLOWED_NUMBERS` tight; the bot ignores everyone else and all group chats.
-- Never commit `.env` or any credentials. The service-account JSON lives outside
-  the repo and is mounted read-only.
+- Never commit `.env` or any credentials. The service-account JSON and Gmail
+  tokens live outside the repo and are mounted read-only.
+- Email is **draft-only** — there is deliberately no send capability in the code.

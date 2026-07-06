@@ -21,6 +21,7 @@ from sqlalchemy import select
 import config
 import db
 import gcal
+import gmail
 import scheduler
 
 log = logging.getLogger("app.brain")
@@ -142,6 +143,37 @@ CALENDAR_TOOLS = [
             },
         },
     },
+]
+
+# Email tools are only offered to a member who has opted into Gmail (a token
+# file exists for their number). The bot creates DRAFTS only — never sends.
+EMAIL_TOOLS = [
+    {
+        "name": "draft_email",
+        "description": (
+            "Draft an email reply in the member's own Gmail Drafts for them to "
+            "review and send. This NEVER sends. Reaching outside the system is "
+            "CONFIRM-FIRST: this records a proposal and does not create the draft "
+            "until the user confirms."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Recipient email address."},
+                "subject": {"type": "string", "description": "Subject line."},
+                "body": {"type": "string", "description": "The draft email body."},
+                "in_reply_to": {
+                    "type": "string",
+                    "description": "Optional Message-ID this is a reply to (threads the draft).",
+                },
+            },
+            "required": ["to", "subject", "body"],
+        },
+    },
+]
+
+# The confirm-first resolver, offered whenever any confirm-first capability is on.
+CONFIRM_TOOLS = [
     {
         "name": "resolve_confirmation",
         "description": (
@@ -338,11 +370,16 @@ def _tool_resolve_confirmation(member, args: dict) -> str:
     if expired:
         return f"That request (#{cid}) expired — please ask again."
     if not approve:
-        return "Okay, cancelled — nothing was added."
+        return "Okay, cancelled — nothing was done."
 
-    if kind != "calendar_event":
-        return f"ERROR: unknown confirmation kind {kind!r}."
+    if kind == "calendar_event":
+        return _execute_calendar_event(member, cid, payload)
+    if kind == "email_draft":
+        return _execute_email_draft(member, cid, payload)
+    return f"ERROR: unknown confirmation kind {kind!r}."
 
+
+def _execute_calendar_event(member, cid: int, payload: dict) -> str:
     start_utc = datetime.fromisoformat(payload["start_utc"])
     end_utc = datetime.fromisoformat(payload["end_utc"])
     try:
@@ -368,9 +405,70 @@ def _tool_resolve_confirmation(member, args: dict) -> str:
                 html_link=event.get("htmlLink"),
             )
         )
-
     when = _utc_to_local_str(start_utc, member.timezone)
     return f"Added '{payload['title']}' to the family calendar for {when}."
+
+
+def _execute_email_draft(member, cid: int, payload: dict) -> str:
+    try:
+        draft = gmail.create_draft(
+            member.whatsapp_number,
+            payload["to"],
+            payload["subject"],
+            payload["body"],
+            in_reply_to=payload.get("in_reply_to"),
+        )
+    except Exception:
+        log.exception("gmail draft failed")
+        return "ERROR: couldn't create the draft (Gmail API error)."
+
+    with db.session_scope() as session:
+        pending = session.get(db.PendingConfirmation, cid)
+        if pending is not None:
+            pending.status = db.PC_EXECUTED
+        session.add(
+            db.EmailDraft(
+                member_id=member.id,
+                gmail_draft_id=draft["id"],
+                recipient=payload["to"],
+                subject=payload["subject"],
+                body=payload["body"],
+                in_reply_to=payload.get("in_reply_to"),
+                status="created",
+            )
+        )
+    return (
+        f"Drafted an email to {payload['to']} (subject: '{payload['subject']}'). "
+        "It's in your Gmail Drafts to review and send — I never send it for you."
+    )
+
+
+def _tool_draft_email(member, args: dict) -> str:
+    if not gmail.has_credentials(member.whatsapp_number):
+        return "ERROR: email isn't set up for you yet (no Gmail authorization)."
+    payload = {
+        "to": args["to"],
+        "subject": args["subject"],
+        "body": args["body"],
+        "in_reply_to": args.get("in_reply_to"),
+    }
+    with db.session_scope() as session:
+        pending = db.PendingConfirmation(
+            member_id=member.id,
+            kind="email_draft",
+            payload=json.dumps(payload),
+            status=db.PC_PENDING,
+            expires_at=db.utcnow() + timedelta(minutes=config.CONFIRMATION_TTL_MINUTES),
+        )
+        session.add(pending)
+        session.flush()
+        cid = pending.id
+    return (
+        f"PROPOSED (confirmation_id={cid}): draft email to {args['to']} "
+        f"(subject: '{args['subject']}'). This reaches outside the system — ask the "
+        "user to confirm before creating the draft; do not create it yet. "
+        "(Drafts only; never sent.)"
+    )
 
 
 _DISPATCH = {
@@ -379,6 +477,7 @@ _DISPATCH = {
     "cancel_reminder": _tool_cancel_reminder,
     "create_calendar_event": _tool_create_calendar_event,
     "list_schedule": _tool_list_schedule,
+    "draft_email": _tool_draft_email,
     "resolve_confirmation": _tool_resolve_confirmation,
 }
 
@@ -411,7 +510,7 @@ def _execute_tool(member, name: str, args: dict) -> str:
         return f"ERROR: tool {name} failed unexpectedly."
 
 
-def _system_prompt(member, pending=None) -> str:
+def _system_prompt(member, pending=None, email_enabled=False) -> str:
     now_local = datetime.now(ZoneInfo(member.timezone))
     parts = [SYSTEM_PROMPT]
 
@@ -425,16 +524,31 @@ def _system_prompt(member, pending=None) -> str:
         )
     else:
         parts.append("You cannot read or create calendar events yet — that isn't configured.")
-    parts.append("You cannot draft emails yet — that capability is coming.")
+
+    if email_enabled:
+        parts.append(
+            "You can draft email replies in the member's Gmail with draft_email. "
+            "You NEVER send email — you only create a draft for them to review and "
+            "send themselves. Drafting reaches outside the system, so it is "
+            "CONFIRM-FIRST: propose it, ask them to confirm, and only create it via "
+            "resolve_confirmation once they say yes."
+        )
+    else:
+        parts.append("You cannot draft emails yet — that isn't set up for this member.")
 
     if pending:
         p = pending["payload"]
+        if pending["kind"] == "calendar_event":
+            what = f"calendar event '{p.get('title', '')}' at {p.get('start_utc', '')} UTC"
+        elif pending["kind"] == "email_draft":
+            what = f"email draft to {p.get('to', '')} (subject '{p.get('subject', '')}')"
+        else:
+            what = pending["kind"]
         parts.append(
             f"There is a PENDING confirmation (confirmation_id={pending['id']}) "
-            f"awaiting the user's yes/no — {pending['kind']}: '{p.get('title', '')}' "
-            f"at {p.get('start_utc', '')} UTC. If the user approves in this message, "
-            f"call resolve_confirmation(confirmation_id={pending['id']}, approve=true); "
-            "if they decline, approve=false."
+            f"awaiting the user's yes/no — {what}. If the user approves in this "
+            f"message, call resolve_confirmation(confirmation_id={pending['id']}, "
+            "approve=true); if they decline, approve=false."
         )
 
     parts.append(
@@ -464,8 +578,17 @@ async def generate_reply(message_text: str, sender_number: str) -> str:
         )
 
     pending = _pending_for(member.id)
-    system = _system_prompt(member, pending)
-    tools = TOOLS + (CALENDAR_TOOLS if config.CALENDAR_ENABLED else [])
+    email_enabled = gmail.has_credentials(member.whatsapp_number)
+    system = _system_prompt(member, pending, email_enabled)
+
+    tools = list(TOOLS)
+    if config.CALENDAR_ENABLED:
+        tools += CALENDAR_TOOLS
+    if email_enabled:
+        tools += EMAIL_TOOLS
+    if config.CALENDAR_ENABLED or email_enabled:
+        tools += CONFIRM_TOOLS
+
     messages = [{"role": "user", "content": message_text}]
 
     for _ in range(8):  # safety bound on tool round-trips

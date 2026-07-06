@@ -16,7 +16,9 @@ reminders in natural language, and the app proactively sends each one when due
 and survives a restart. **Shared Google Calendar is now wired too** (rest of M3):
 read the calendar and create events — writes are **confirm-first** (propose →
 "yes" → create). Calendar features stay disabled until a service account +
-calendar id are configured. No email or automations yet.
+calendar id are configured. **Gmail draft replies are wired too (M4)**:
+per-member OAuth, opt-in, and **draft-only — the bot never sends**. Email stays
+off for a member until they've authorized (a token file exists). No automations yet.
 
 ### Code layout (flat modules in `app/`, built via `docker compose build ./app`)
 - `app/config.py` — env settings + allow-list; `DATA_DIR`/`DB_PATH`/`DB_URL`;
@@ -28,8 +30,13 @@ calendar id are configured. No email or automations yet.
   `_pending_for` + `resolve_confirmation`.
 - `app/gcal.py` — Google Calendar client (service account); `create_event`,
   `list_events`. Google libs imported lazily so it's disabled-safe.
+- `app/gmail.py` — Gmail client, **draft-only** (`create_draft`, `has_credentials`);
+  per-member OAuth tokens under `GMAIL_TOKENS_DIR`. No send path exists (spec §9/§10).
+- `scripts/gmail_authorize.py` — one-time local OAuth helper that writes a
+  member's token file (run on a machine with a browser, not the container).
 - `app/db.py` — SQLAlchemy models (`FamilyMember`, `Reminder`, `Message`,
-  `CalendarEvent`, `PendingConfirmation`), sessions, `get_or_create_member`.
+  `CalendarEvent`, `PendingConfirmation`, `EmailDraft`), sessions,
+  `get_or_create_member`.
 - `app/scheduler.py` — APScheduler `AsyncIOScheduler` + persistent SQLAlchemy
   jobstore; `schedule_reminder`, `cancel_reminder_job`, `fire_reminder`.
 
@@ -47,7 +54,8 @@ calendar id are configured. No email or automations yet.
 2. Brain — Claude tool-use loop turning messages into structured intents (DONE).
 3. Calendar + reminders — **DONE**: reminders (fire + survive restart) and
    shared-calendar read/write (writes are confirm-first).
-4. Email drafts — per-user Gmail OAuth, draft-on-request.
+4. Email drafts — per-user Gmail OAuth, draft-on-request. **DONE** (draft-only,
+   confirm-first, opt-in per member).
 5. Automations — allow-list + confirm-first + consent recording.
 6. Cutover — move to the Mac mini.
 
@@ -74,9 +82,10 @@ calendar id are configured. No email or automations yet.
 - Email is **draft-only**. No send capability should exist in code.
 - Consequential actions (shared events, emails) go through confirm-first.
   Personal reminders are low-stakes and execute directly (no confirm).
-  Mechanism: `create_calendar_event` writes a `PendingConfirmation` row instead
-  of acting; the brain injects the latest un-expired pending row into the system
-  prompt, and `resolve_confirmation(id, approve)` executes or declines it. This
+  Mechanism: `create_calendar_event` / `draft_email` write a `PendingConfirmation`
+  row (kind `calendar_event` / `email_draft`) instead of acting; the brain injects
+  the latest un-expired pending row into the system prompt, and
+  `resolve_confirmation(id, approve)` executes or declines it by kind. This
   works across messages with no conversation memory, and expires after
   `CONFIRMATION_TTL_MINUTES`.
 - **Timezones:** store `fire_at_utc` in UTC (naive datetimes that are always
