@@ -130,6 +130,20 @@ Usage (natural language): "reply to Nan saying we'll be there at 1" → the bot
 your Gmail Drafts for you to review and send. Drafting reaches outside the system,
 so it's confirm-first; **the code has no send path at all** (spec §9/§10).
 
+## Automations (allow-list)
+
+The bot runs a small **allow-list of pre-agreed automations** — declared in
+`app/automations.py`, exposed to the assistant via `propose_automation`, and
+listed for it automatically. Anything consequential (affecting others / reaching
+outside the system) is **confirm-first**, and the family's consent is recorded on
+first run.
+
+One example ships: `broadcast_reminder(text, fire_at_iso)` — set the same reminder
+for every active family member (e.g. "remind everyone bins go out Thursday 7pm").
+Because it affects others it's confirm-first: the bot proposes it and only runs it
+after a "yes". Add your own by appending an `AutomationSpec` (see `CLAUDE.md` →
+"Adding an automation").
+
 ## Safety notes
 - Keep `ALLOWED_NUMBERS` tight; the bot ignores everyone else and all group chats.
 - Never commit `.env` or any credentials. The service-account JSON and Gmail
