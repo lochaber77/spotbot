@@ -28,3 +28,19 @@ TZ = os.getenv("TZ", "Europe/London")
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "app.sqlite"))
 DB_URL = f"sqlite:///{DB_PATH}"
+
+# --- Google Calendar (M3) ---
+# One shared calendar, written via a service account (no per-person OAuth).
+# GOOGLE_SERVICE_ACCOUNT_JSON is the path INSIDE the container to the mounted,
+# read-only service-account key. Calendar features stay disabled (and the bot
+# says so) until both the calendar id and a readable key file are present.
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+CALENDAR_ENABLED = bool(
+    GOOGLE_CALENDAR_ID
+    and GOOGLE_SERVICE_ACCOUNT_JSON
+    and os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON)
+)
+
+# Confirm-first: how long a proposed action waits for the user's "yes".
+CONFIRMATION_TTL_MINUTES = int(os.getenv("CONFIRMATION_TTL_MINUTES", "30"))
