@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 
+import automations
 import config
 import db
 import scheduler
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI):
     # Init the datastore and start the scheduler. The persistent jobstore
     # rehydrates any pending reminder jobs, so reminders survive a restart.
     db.init_db()
+    automations.sync_db()
     scheduler.start()
     log.info("Startup complete. Allow-listed numbers: %d", len(config.ALLOWED_NUMBERS))
     try:

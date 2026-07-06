@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from anthropic import AsyncAnthropic
 from sqlalchemy import select
 
+import automations
 import config
 import db
 import gcal
@@ -168,6 +169,30 @@ EMAIL_TOOLS = [
                 },
             },
             "required": ["to", "subject", "body"],
+        },
+    },
+]
+
+# Automations are always available (no external creds needed).
+AUTOMATION_TOOLS = [
+    {
+        "name": "propose_automation",
+        "description": (
+            "Run one of the family's pre-agreed automations (listed in the system "
+            "prompt). Consequential ones are confirm-first: this records a proposal "
+            "and asks the user to confirm before running."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The automation's name."},
+                "args": {
+                    "type": "object",
+                    "description": "Arguments for the automation (per its usage).",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["name"],
         },
     },
 ]
@@ -376,7 +401,27 @@ def _tool_resolve_confirmation(member, args: dict) -> str:
         return _execute_calendar_event(member, cid, payload)
     if kind == "email_draft":
         return _execute_email_draft(member, cid, payload)
+    if kind == "automation":
+        return _execute_automation(member, cid, payload)
     return f"ERROR: unknown confirmation kind {kind!r}."
+
+
+def _execute_automation(member, cid: int, payload: dict) -> str:
+    spec = automations.get_enabled(payload["name"])
+    if spec is None:
+        return f"ERROR: automation {payload['name']!r} is no longer available."
+    try:
+        result = spec.execute(member, payload.get("args") or {})
+    except Exception:
+        log.exception("automation %s failed", payload["name"])
+        return f"ERROR: the automation {payload['name']} failed to run."
+
+    with db.session_scope() as session:
+        pending = session.get(db.PendingConfirmation, cid)
+        if pending is not None:
+            pending.status = db.PC_EXECUTED
+    automations.record_consent(payload["name"])
+    return result
 
 
 def _execute_calendar_event(member, cid: int, payload: dict) -> str:
@@ -471,6 +516,42 @@ def _tool_draft_email(member, args: dict) -> str:
     )
 
 
+def _tool_propose_automation(member, args: dict) -> str:
+    name = args.get("name")
+    spec = automations.get_enabled(name)
+    if spec is None:
+        return f"ERROR: no enabled automation named {name!r}."
+    automation_args = args.get("args") or {}
+
+    if not spec.requires_confirmation:
+        # Low-stakes / self-affecting — run directly.
+        try:
+            result = spec.execute(member, automation_args)
+        except Exception:
+            log.exception("automation %s failed", name)
+            return f"ERROR: the automation {name} failed to run."
+        automations.record_consent(name)
+        return result
+
+    # Consequential — confirm-first.
+    with db.session_scope() as session:
+        pending = db.PendingConfirmation(
+            member_id=member.id,
+            kind="automation",
+            payload=json.dumps({"name": name, "args": automation_args}),
+            status=db.PC_PENDING,
+            expires_at=db.utcnow() + timedelta(minutes=config.CONFIRMATION_TTL_MINUTES),
+        )
+        session.add(pending)
+        session.flush()
+        cid = pending.id
+    return (
+        f"PROPOSED (confirmation_id={cid}): automation '{name}'. "
+        "Tell the user what it will do and ask them to confirm before it runs; "
+        "do not run it yet."
+    )
+
+
 _DISPATCH = {
     "set_reminder": _tool_set_reminder,
     "list_reminders": _tool_list_reminders,
@@ -478,6 +559,7 @@ _DISPATCH = {
     "create_calendar_event": _tool_create_calendar_event,
     "list_schedule": _tool_list_schedule,
     "draft_email": _tool_draft_email,
+    "propose_automation": _tool_propose_automation,
     "resolve_confirmation": _tool_resolve_confirmation,
 }
 
@@ -536,12 +618,18 @@ def _system_prompt(member, pending=None, email_enabled=False) -> str:
     else:
         parts.append("You cannot draft emails yet — that isn't set up for this member.")
 
+    automations_desc = automations.describe_enabled()
+    if automations_desc:
+        parts.append(automations_desc)
+
     if pending:
         p = pending["payload"]
         if pending["kind"] == "calendar_event":
             what = f"calendar event '{p.get('title', '')}' at {p.get('start_utc', '')} UTC"
         elif pending["kind"] == "email_draft":
             what = f"email draft to {p.get('to', '')} (subject '{p.get('subject', '')}')"
+        elif pending["kind"] == "automation":
+            what = f"automation '{p.get('name', '')}'"
         else:
             what = pending["kind"]
         parts.append(
@@ -581,13 +669,14 @@ async def generate_reply(message_text: str, sender_number: str) -> str:
     email_enabled = gmail.has_credentials(member.whatsapp_number)
     system = _system_prompt(member, pending, email_enabled)
 
-    tools = list(TOOLS)
+    tools = list(TOOLS) + AUTOMATION_TOOLS
     if config.CALENDAR_ENABLED:
         tools += CALENDAR_TOOLS
     if email_enabled:
         tools += EMAIL_TOOLS
-    if config.CALENDAR_ENABLED or email_enabled:
-        tools += CONFIRM_TOOLS
+    # Automations can always create pending confirmations, so the resolver is
+    # always offered.
+    tools += CONFIRM_TOOLS
 
     messages = [{"role": "user", "content": message_text}]
 

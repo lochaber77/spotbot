@@ -126,6 +126,25 @@ class EmailDraft(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
 
 
+class Automation(Base):
+    """A declared, allow-listed automation (M5).
+
+    The behaviour lives in code (app/automations.py); this row carries the
+    operational metadata: whether it's enabled, whether it needs confirmation,
+    and when the family first consented to it.
+    """
+
+    __tablename__ = "automations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    description: Mapped[str] = mapped_column(String, nullable=False)
+    requires_confirmation: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    consent_recorded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+
+
 class PendingConfirmation(Base):
     """A consequential action (e.g. a shared calendar write) awaiting a yes/no.
 
