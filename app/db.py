@@ -107,6 +107,25 @@ class CalendarEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
 
 
+class EmailDraft(Base):
+    """Record of a Gmail draft the bot created for a member (M4).
+
+    The bot only ever creates drafts — it never sends (spec §9/§10).
+    """
+
+    __tablename__ = "email_drafts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    member_id: Mapped[int] = mapped_column(ForeignKey("family_members.id"), nullable=False)
+    gmail_draft_id: Mapped[str] = mapped_column(String, nullable=False)
+    recipient: Mapped[str | None] = mapped_column(String, nullable=True)
+    subject: Mapped[str | None] = mapped_column(String, nullable=True)
+    body: Mapped[str | None] = mapped_column(String, nullable=True)
+    in_reply_to: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="created", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+
+
 class PendingConfirmation(Base):
     """A consequential action (e.g. a shared calendar write) awaiting a yes/no.
 
