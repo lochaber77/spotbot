@@ -1,0 +1,20 @@
+# Secrets — never commit
+.env
+*.json.key
+service-account*.json
+token*.json
+
+# Data & sessions
+*.sqlite
+*.sqlite3
+/data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
