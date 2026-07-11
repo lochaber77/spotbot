@@ -1,9 +1,11 @@
 services:
   # Unofficial WhatsApp HTTP API. Keeps the messy session handling in its own
-  # container and exposes a webhook (inbound) + REST (send). Multi-arch image,
-  # so it builds/pulls natively on the arm64 Mac mini.
+  # container and exposes a webhook (inbound) + REST (send). The published image
+  # is amd64-only, so on the arm64 Mac mini it runs under emulation via the
+  # platform pin below (Docker Desktop / Rosetta). On amd64 hosts it's native.
   waha:
     image: devlikeapro/waha:latest
+    platform: linux/amd64
     restart: unless-stopped
     ports:
       - "3000:3000"
