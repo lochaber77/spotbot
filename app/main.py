@@ -66,6 +66,10 @@ async def webhook(request: Request):
     if raw_from.endswith("@g.us"):
         return {"ignored": "group chat"}
 
+    # The allow-list gate matches on the digits/id before the '@'. But WhatsApp
+    # may address a sender by phone ('…@c.us') or by privacy id ('…@lid'), and
+    # replies/reminders must go back to that *exact* chat — so we carry the full
+    # chat id (raw_from) as the member's identity and send target.
     number = raw_from.split("@", 1)[0]
     body = (payload.get("body") or "").strip()
 
@@ -80,12 +84,12 @@ async def webhook(request: Request):
     log.info("Message from %s: %s", number, body)
 
     try:
-        reply = await generate_reply(body, number)
-        await whatsapp.send_text(number, reply)
+        reply = await generate_reply(body, raw_from)
+        await whatsapp.send_text(raw_from, reply)
     except Exception:
         log.exception("Failed to handle message")
         await whatsapp.send_text(
-            number, "Sorry — something went wrong on my end. Try again in a moment."
+            raw_from, "Sorry — something went wrong on my end. Try again in a moment."
         )
 
     return {"ok": True}
